@@ -1,7 +1,10 @@
 # usagebar
 
 Your Claude Code plan quota in the macOS menu bar, plus an MCP tool so agents can
-check the quota and their own context size before starting big work.
+check the quota and their own context size before starting big work. An agent can
+decide to wait for a reset, split work, or stop before it hits the limit.
+
+<img src="docs/agent.png" width="800" alt="Claude Code calling get_usage and advising whether to start a big refactor before the quota reset">
 
 <img src="docs/menu.png" width="651" alt="usagebar menu: session and weekly quota percentages with reset countdowns">
 
@@ -64,8 +67,6 @@ Intervals are saved to `~/.config/usagebar.json`. Log: `/tmp/usagebar.log`.
 
 ## MCP tool
 
-<img src="docs/agent.png" width="800" alt="Claude Code calling get_usage and advising whether to start a big refactor before the quota reset">
-
 `mcp_server.py` (standard library only) gives agents one tool, `get_usage`, returning:
 
 - `plan`: quota percentages and reset times, shared with the menu bar app through
@@ -100,9 +101,18 @@ the raw `/usage` output, shortened):
 }
 ```
 
-Agents can use it to decide when to stop, split work into subagents, or wait for a
-reset, for example: "check get_usage every hour; if the session is above 80%, finish
-the current step and stop".
+## Let your agents budget themselves
+
+Paste this into your project or user `CLAUDE.md` (after the MCP setup above):
+
+```markdown
+## Usage budget
+- Before long or parallel work, and about every hour during it, call the
+  `mcp__usagebar__get_usage` tool.
+- If the session quota is above 80%, finish the current step, then stop or wait
+  for the reset time it reports.
+- If context is above 50%, compact or hand off to a fresh session.
+```
 
 ## Privacy
 

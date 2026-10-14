@@ -12,7 +12,9 @@ DIR="${USAGEBAR_DIR:-$HOME/.local/share/usagebar}"
 fail() { echo "usagebar: $*" >&2; exit 1; }
 
 [ "$(uname)" = Darwin ] || fail "macOS only"
-PY=$(command -v python3) || fail "python3 not found (xcode-select --install, or brew install python)"
+# An existing venv was made with a good python; PATH may now lead to the stock 3.9.
+if [ -x "$DIR/.venv/bin/python" ]; then PY="$DIR/.venv/bin/python"
+else PY=$(command -v python3) || fail "python3 not found (xcode-select --install, or brew install python)"; fi
 "$PY" -c 'import sys; sys.exit(sys.version_info < (3, 10))' || fail "python3 3.10 or newer needed"
 
 TAG=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" |

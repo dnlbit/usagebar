@@ -1,0 +1,10 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 monitor.py --test
+      - run: python3 mcp_server.py --test
+      - run: sh -n install.sh

@@ -14,7 +14,7 @@ so a Claude Code release can break parsing until usagebar is updated.
     curl -fsSL https://usagebar.dnlbit.com/install.sh | sh
 
 Installs into `~/.local/share/usagebar` (Python venv with `rumps`), starts at login,
-and prints the `claude mcp add` command for the MCP tool. Needs macOS, `python3` 3.9+
+and prints the `claude mcp add` command for the MCP tool. Needs macOS, `python3` 3.10+
 and `claude` on your PATH.
 
 Updates: the app checks GitHub Releases once a day and shows "Update to vX.Y.Z" in
@@ -98,4 +98,4 @@ makes itself and the daily update check to `api.github.com`.
     python3 monitor.py --test && python3 mcp_server.py --test
 
 A git checkout never offers updates. Release: bump `__version__` in `monitor.py`,
-commit, then `gh release create vX.Y.Z --generate-notes`.
+commit, then `gh release create vX.Y.Z --generate-notes`. Tags are never moved or re-pointed; fix a bad release with a new version.

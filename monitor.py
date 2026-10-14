@@ -18,7 +18,7 @@ try:
 except ImportError:  # --test mode runs without the dependency
     AppKit = rumps = None
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 REPO = "dnlbit/usagebar"
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.expanduser("~/.config/usagebar.json")

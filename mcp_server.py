@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Stdio MCP server: Claude plan usage (as last polled by monitor.py) and the
-calling Claude Code session's context size. Standard library only.
+"""Stdio MCP server: Claude plan usage (shared with the menu bar app, refreshed on
+demand) and the calling Claude Code session's context size. Standard library only.
 
     claude mcp add usagebar -s user -- python3 /path/to/mcp_server.py
 """
 
+import fcntl
 import glob
 import json
 import os
 import re
 import sys
+import time
+from datetime import datetime
 
-from monitor import STATE_PATH, __version__
+import monitor
+from monitor import __version__
 
 PROJECTS = os.path.expanduser("~/.claude/projects")
 # Model max context windows (Anthropic docs). Claude Code auto-compacts earlier (500k for Opus 5.5).
@@ -26,13 +30,18 @@ WINDOWS = {
 TOOLS = [
     {
         "name": "get_usage",
-        "description": "Claude plan quota and this session's context in one call. plan: percent used and "
-                       "reset time for the 5-hour session window and the week, polled by the menu bar "
-                       "monitor every 5-20 min (fetched_at says how fresh). context: tokens in the calling "
-                       "Claude Code session's context, the model's max window, and percent used.",
+        "description": "Claude plan quota and this session's context in one call, for planning long work. "
+                       "plan: percent used and reset time for the 5-hour session window and each weekly "
+                       "quota; refetched (about 2s) when older than max_age_minutes, fetched_at says when. "
+                       "context: tokens in the calling Claude Code session's context, the model's max "
+                       "window, and percent used.",
         "inputSchema": {
             "type": "object",
-            "properties": {"session_id": {"type": "string", "description": "Defaults to the calling session."}},
+            "properties": {
+                "max_age_minutes": {"type": "number", "minimum": 0, "default": 2,
+                                    "description": "Reuse plan data up to this old; 0 forces a fresh fetch."},
+                "session_id": {"type": "string", "description": "Defaults to the calling session."},
+            },
         },
     },
 ]
@@ -42,12 +51,29 @@ class ToolError(Exception):
     """Reported to the agent as a failed tool call, not a protocol error."""
 
 
-def get_usage(_):
+def read_state():
     try:
-        with open(STATE_PATH) as fh:
+        with open(monitor.STATE_PATH) as fh:
             return json.load(fh)
-    except FileNotFoundError:
-        raise ToolError("No usage recorded yet. Is the menu bar app (monitor.py) running?")
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def get_usage(args):
+    max_age = args.get("max_age_minutes", 2)
+    if not isinstance(max_age, (int, float)) or max_age < 0:
+        raise ToolError("max_age_minutes must be a number >= 0")
+    os.makedirs(os.path.dirname(monitor.STATE_PATH), exist_ok=True)
+    with open(monitor.STATE_PATH + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # many agents asking at once share one claude run
+        state = read_state()
+        fetched = isinstance(state, dict) and state.get("fetched_at")
+        if not fetched or time.time() - datetime.fromisoformat(fetched).timestamp() > max_age * 60:
+            monitor.save_state(*monitor.fetch())
+            state = read_state()
+    if not state:
+        raise ToolError("Could not fetch usage; see %s" % monitor.LOG_PATH)
+    return state
 
 
 def find_transcript(session_id):
@@ -154,6 +180,20 @@ def test():
     import tempfile
     global PROJECTS
     PROJECTS = tempfile.mkdtemp()
+    monitor.STATE_PATH = os.path.join(PROJECTS, "state", "last.json")
+    calls = []
+    monitor.fetch = lambda: calls.append(1) or ("Current session: 5% used", None)
+    assert get_usage({})["quotas"]["Current session"]["percent_used"] == 5 and len(calls) == 1
+    get_usage({})  # fresh enough: no second fetch
+    assert len(calls) == 1
+    get_usage({"max_age_minutes": 0})
+    assert len(calls) == 2
+    for bad in (-1, "5"):
+        try:
+            get_usage({"max_age_minutes": bad})
+            raise AssertionError(bad)
+        except ToolError:
+            pass
     os.makedirs(os.path.join(PROJECTS, "-proj"))
     rows = [
         {"type": "assistant", "isSidechain": False, "message": {"model": "m1", "usage": {

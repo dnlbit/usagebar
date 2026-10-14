@@ -45,8 +45,10 @@ Intervals are saved to `~/.config/usagebar.json`. Log: `/tmp/usagebar.log`.
 
 `mcp_server.py` (standard library only) gives agents one tool, `get_usage`, returning:
 
-- `plan`: the last poll, read from `~/.cache/usagebar/last.json` (written by the menu
-  bar app, so the app must be running; `fetched_at` says how fresh it is).
+- `plan`: quota percentages and reset times, shared with the menu bar app through
+  `~/.cache/usagebar/last.json`. If that is older than `max_age_minutes` (default 2;
+  0 forces it), the tool runs `claude -p /usage` itself (about 2s), so it works
+  without the app. `fetched_at` says how fresh it is.
 - `context`: tokens in the calling Claude Code session's context, the model's max
   window (hard-coded table in `mcp_server.py`) and percent used.
 

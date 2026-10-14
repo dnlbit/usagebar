@@ -3,6 +3,8 @@
 Your Claude Code plan quota in the macOS menu bar, plus an MCP tool so agents can
 check the quota and their own context size before starting big work.
 
+<img src="docs/menu.png" width="651" alt="usagebar menu: session and weekly quota percentages with reset countdowns">
+
 Not affiliated with Anthropic. It reads what `claude -p /usage` prints and the
 transcripts Claude Code keeps in `~/.claude/projects/`. Neither format is documented,
 so a Claude Code release can break parsing until usagebar is updated.
@@ -29,7 +31,7 @@ Uninstall:
 ## Menu bar
 
 The bar shows the current session quota (`▰▰▱▱▱ 48%`). Hover for the reset time, click
-for the full `/usage` output, with "in 1h 52m" after each reset time.
+for each quota with "in 1h 52m" after its reset time.
 
 Settings… holds:
 
@@ -52,7 +54,34 @@ Intervals are saved to `~/.config/usagebar.json`. Log: `/tmp/usagebar.log`.
 - `context`: tokens in the calling Claude Code session's context, the model's max
   window (hard-coded table in `mcp_server.py`) and percent used.
 
-Either part comes back as `{"error": ...}` on its own if it fails.
+Either part comes back as `{"error": ...}` on its own if it fails. Example (`text`,
+the raw `/usage` output, shortened):
+
+```json
+{
+ "plan": {
+  "fetched_at": "2026-10-13T22:53:05-07:00",
+  "error": null,
+  "quotas": {
+   "Current session": {"percent_used": 41, "resets_at": "2026-10-13T23:59:00-07:00"},
+   "Current week (all models)": {"percent_used": 16, "resets_at": "2026-10-20T15:59:00-07:00"},
+   "Current week (Fable)": {"percent_used": 0, "resets_at": "2026-10-20T16:00:00-07:00"}
+  },
+  "text": "You are currently using your subscription to power your Claude Code usage\n\nCurrent session: 41% used …"
+ },
+ "context": {
+  "session_id": "a659f724-dd01-40c3-bcbe-6a3d33bd43a6",
+  "model": "claude-opus-5-5",
+  "context_tokens": 135210,
+  "window_tokens": 1000000,
+  "percent_used": 13.5
+ }
+}
+```
+
+Agents can use it to decide when to stop, split work into subagents, or wait for a
+reset, for example: "check get_usage every hour; if the session is above 80%, finish
+the current step and stop".
 
 ## Privacy
 

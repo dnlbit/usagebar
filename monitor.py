@@ -118,6 +118,14 @@ def parse(text):
     return out
 
 
+def menu_lines(text):
+    """Lines up to the last quota line. The usage breakdown after it is wider than a
+    laptop screen; unrecognised output comes back whole so nothing is hidden."""
+    lines = text.splitlines()
+    quota = [i for i, line in enumerate(lines) if LINE_RE.match(line)]
+    return lines[:quota[-1] + 1] if quota else lines
+
+
 def usage_key(text):
     """Percentages only, so reset-time jitter (3:59pm vs 4pm) is not a change."""
     return tuple(pct for _, (pct, _) in sorted(parse(text).items())) if text else None
@@ -346,7 +354,7 @@ class Monitor(rumps.App if rumps else object):
             else:
                 self.title = bar(self.session[0])
             seen = set()
-            for line in text.splitlines():
+            for line in menu_lines(text):
                 title = line.rstrip()
                 if not title:
                     items.append(None)  # blank line -> separator
@@ -450,6 +458,10 @@ def test():
 
     assert minutes(" 7 ", 20) == 7
     assert minutes("0", 20) == 20 and minutes("x", 20) == 20 and minutes("1441", 5) == 5
+
+    menu = menu_lines(SAMPLE)
+    assert menu[-1].startswith("Current week (all models)") and not any("Last 24h" in l for l in menu), menu
+    assert menu_lines("odd output\nmore") == ["odd output", "more"]
 
     # any "Current week (<model>)" line is a quota
     fable = parse("Current week (Fable): 0% used\nCurrent week (all models): 15% used")

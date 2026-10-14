@@ -54,6 +54,7 @@ def fetch():
     try:
         proc = subprocess.run(
             ["claude", "-p", "/usage"],
+            stdin=subprocess.DEVNULL,  # under mcp_server.py stdin is the JSON-RPC pipe; claude would read it
             capture_output=True,
             text=True,
             timeout=120,

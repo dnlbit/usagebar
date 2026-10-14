@@ -45,6 +45,8 @@ Intervals are saved to `~/.config/usagebar.json`. Log: `/tmp/usagebar.log`.
 
 ## MCP tool
 
+<img src="docs/agent.png" width="800" alt="Claude Code calling get_usage and advising whether to start a big refactor before the quota reset">
+
 `mcp_server.py` (standard library only) gives agents one tool, `get_usage`, returning:
 
 - `plan`: quota percentages and reset times, shared with the menu bar app through

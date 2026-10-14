@@ -11,6 +11,24 @@ so a Claude Code release can break parsing until usagebar is updated.
 
 ## Install
 
+### Homebrew
+
+    brew install dnlbit/tap/usagebar
+    brew services start usagebar
+    claude mcp add usagebar -s user -- "$(brew --prefix)/opt/usagebar/bin/usagebar-mcp"
+
+`brew services start` starts the menu bar app now and at login. Update with
+`brew upgrade usagebar`: the in-app updater is off for Homebrew installs. Needs
+`claude` on your PATH (`~/.local/bin`, `/opt/homebrew/bin` or `/usr/local/bin`).
+
+Uninstall:
+
+    brew services stop usagebar
+    brew uninstall usagebar
+    claude mcp remove usagebar -s user
+
+### Install script
+
     curl -fsSL https://usagebar.dnlbit.com/install.sh | sh
 
 Installs into `~/.local/share/usagebar` (Python venv with `rumps`), starts at login,

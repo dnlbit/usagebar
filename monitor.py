@@ -206,10 +206,16 @@ def version_tuple(tag):
     return tuple(int(n) for n in re.findall(r"\d+", tag))
 
 
-def updates_enabled():
+def homebrew_install(path=__file__):
+    # realpath: Homebrew runs us through /opt/homebrew/opt/<name> symlinks, which hide /Cellar/
+    return "/Cellar/" in os.path.realpath(path)
+
+
+def updates_enabled(path=__file__):
     """Only installs made by install.sh update themselves: a git checkout is a
     dev copy, and Homebrew installs update with `brew upgrade`."""
-    return not os.path.exists(os.path.join(HERE, ".git")) and "/Cellar/" not in HERE
+    here = os.path.dirname(os.path.abspath(path))
+    return not os.path.exists(os.path.join(here, ".git")) and not homebrew_install(path)
 
 
 def latest_release():
@@ -234,7 +240,8 @@ def install_update():
 
 
 def settings_dialog(cfg, autostart):
-    """Modal settings form. Returns (cfg, autostart) or None on cancel."""
+    """Modal settings form. Returns (cfg, autostart) or None on cancel.
+    autostart is None for a Homebrew install: `brew services` owns login start."""
     alert = AppKit.NSAlert.alloc().init()
     alert.setMessageText_("Claude Usage Monitor Settings")
     alert.setInformativeText_("Polls every idle interval; after usage changes, "
@@ -254,10 +261,17 @@ def settings_dialog(cfg, autostart):
 
     cold = field(66, "Idle interval (minutes):", cfg["cold_minutes"])
     warm = field(36, "Active interval (minutes):", cfg["warm_minutes"])
-    login = AppKit.NSButton.checkboxWithTitle_target_action_("Auto start at login", None, None)
-    login.setFrame_(((0, 2), (280, 22)))
-    login.setState_(1 if autostart else 0)
-    view.addSubview_(login)
+    if homebrew_install():
+        login = None
+        hint = AppKit.NSTextField.labelWithString_("Start at login: brew services start usagebar")
+        hint.setSelectable_(True)  # so the command can be copied
+        hint.setFrame_(((0, 2), (280, 22)))
+        view.addSubview_(hint)
+    else:
+        login = AppKit.NSButton.checkboxWithTitle_target_action_("Auto start at login", None, None)
+        login.setFrame_(((0, 2), (280, 22)))
+        login.setState_(1 if autostart else 0)
+        view.addSubview_(login)
     alert.setAccessoryView_(view)
     alert.window().setInitialFirstResponder_(cold)
     if alert.runModal() != AppKit.NSAlertFirstButtonReturn:
@@ -266,7 +280,7 @@ def settings_dialog(cfg, autostart):
         "cold_minutes": minutes(cold.stringValue(), cfg["cold_minutes"]),
         "warm_minutes": minutes(warm.stringValue(), cfg["warm_minutes"]),
     }
-    return new, login.state() == 1
+    return new, None if login is None else login.state() == 1
 
 
 class Monitor(rumps.App if rumps else object):
@@ -417,7 +431,8 @@ class Monitor(rumps.App if rumps else object):
         self.cfg, autostart = result
         save_config(self.cfg)
         try:
-            set_autostart(autostart)
+            if autostart is not None:  # None: Homebrew install, brew services owns it
+                set_autostart(autostart)
         except OSError as exc:
             log("autostart: %s" % exc)
             rumps.alert("Could not change auto start", str(exc))
@@ -492,6 +507,24 @@ def test():
     assert parse_reset("not a date", "America/Los_Angeles") is None
     assert parse_reset("Sep 17 at 1:40pm", "Not/AZone") is None
     assert parse("nothing here") == {}
+
+    # install kind: Homebrew runs us through an opt symlink into the Cellar
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        libexec = os.path.join(tmp, "Cellar", "usagebar", "0.0.0", "libexec")
+        os.makedirs(libexec)
+        open(os.path.join(libexec, "monitor.py"), "w").close()
+        os.makedirs(os.path.join(tmp, "opt"))
+        os.symlink(libexec, os.path.join(tmp, "opt", "usagebar"))
+        via_opt = os.path.join(tmp, "opt", "usagebar", "monitor.py")
+        assert "/Cellar/" not in os.path.abspath(via_opt)
+        assert homebrew_install(via_opt) and not updates_enabled(via_opt)
+        plain = os.path.join(tmp, "plain", "monitor.py")
+        os.makedirs(os.path.dirname(plain))
+        open(plain, "w").close()
+        assert not homebrew_install(plain) and updates_enabled(plain)
+        os.makedirs(os.path.join(tmp, "plain", ".git"))
+        assert not updates_enabled(plain)
     print("ok")
 
 

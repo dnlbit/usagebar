@@ -39,7 +39,8 @@ Settings… holds:
 - Active interval (default 5 min): used after a poll sees the percentages change,
   until a poll sees no change.
 - Auto start at login: writes `~/Library/LaunchAgents/com.dnlbit.usagebar.plist`
-  (unchecking removes it). Takes effect at next login.
+  (unchecking removes it). Takes effect at next login. Homebrew installs have no
+  checkbox: use `brew services start usagebar` to start at login.
 
 Intervals are saved to `~/.config/usagebar.json`. Log: `/tmp/usagebar.log`.
 

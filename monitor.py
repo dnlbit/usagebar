@@ -29,7 +29,7 @@ STATE_PATH = os.path.expanduser("~/.cache/usagebar/last.json")  # read by mcp_se
 LABEL = "com.dnlbit.usagebar"
 PLIST_DST = os.path.expanduser("~/Library/LaunchAgents/%s.plist" % LABEL)
 # cold: poll slowly while usage is flat; warm: poll faster after a change
-DEFAULTS = {"cold_minutes": 20, "warm_minutes": 5, "notify_waiting": True, "notify_finished": False}
+DEFAULTS = {"cold_minutes": 20, "warm_minutes": 5, "notify_waiting": True, "notify_finished": True}
 SEGMENTS = 5
 FILLED, EMPTY = "▰", "▱"
 NEUTRAL = "◉"
@@ -46,7 +46,11 @@ WINDOWS = {
 }
 # Seen on Claude Code 2.1.299 (2026-10-15): running a tool -> "busy"; permission prompt ->
 # "waiting" with waitingFor "permission prompt"; turn finished, waiting for the user -> "idle".
-STATE_ICONS = {"waiting": "⚠", "busy": "●", "idle": "○"}
+# "shell" (2.1.300 source): turn finished but a background shell task still runs; the user can type, so "your turn".
+# (icon, label) per status; title counts follow this icon order.
+STATES = {"busy": ("●", "working"), "shell": ("○", "your turn (background shell)"), "idle": ("○", "your turn"),
+          "waiting": ("⚠", "blocked")}
+TITLE_ICONS = ("●", "○", "⚠")
 
 LINE_RE = re.compile(
     r"^(Current session|Current week \([^)]+\)): (\d+)% used(?: · resets (.+?) \((.+?)\))?$",
@@ -235,15 +239,15 @@ def read_sessions(directory=SESSIONS_DIR, alive=pid_alive, previous=None):
 def session_state(session):
     """(icon, text) for a session's status; unknown values show raw so new states do not break the menu."""
     status = session.get("status") or "?"
-    if status == "waiting":
-        return STATE_ICONS[status], session.get("waitingFor") or status
-    return STATE_ICONS.get(status, "·"), status
+    icon, label = STATES.get(status, ("·", None))
+    return icon, (status == "waiting" and session.get("waitingFor")) or label or status
 
 
 def session_events(previous, sessions):
     """(kind, session) for status changes since the last poll. previous maps pid -> session;
     sessions not in it are new (or the app just started) and never notify. A busy spell
-    under 2 s (e.g. /context) is not a finished turn."""
+    under 2 s (e.g. /context) is not a finished turn; waiting -> idle is (prompt approved,
+    turn ended between two polls)."""
     events = []
     for session in sessions:
         if session["pid"] not in previous:
@@ -252,9 +256,9 @@ def session_events(previous, sessions):
         old, new = before.get("status"), session.get("status")
         if new == "waiting" and old != "waiting":
             events.append(("notify_waiting", session))
-        elif old == "busy" and new == "idle":
+        elif old in ("busy", "waiting") and new in ("idle", "shell"):  # shell -> idle later does not notify again
             busy_ms = (session.get("statusUpdatedAt") or 0) - (before.get("statusUpdatedAt") or 0)
-            if busy_ms >= 2000:
+            if old == "waiting" or busy_ms >= 2000:
                 events.append(("notify_finished", session))
     return events
 
@@ -372,12 +376,12 @@ def quota_title(text, error):
 
 
 def build_title(quota, sessions):
-    """'▰▰▱▱▱ 48% 3 ⚠1', '◉3 ⚠1' without quotas, '◉' with neither."""
-    if not sessions:
+    """'▰▰▱▱▱ 48%  ●1 ○2 ⚠1', '●1 ○2 ⚠1' without quotas, '◉' with neither. Empty groups and unknown states are left out."""
+    icons = [session_state(s)[0] for s in sessions]
+    counts = " ".join("%s%d" % (i, icons.count(i)) for i in TITLE_ICONS if i in icons)
+    if not counts:
         return quota or NEUTRAL
-    waiting = sum(s.get("status") == "waiting" for s in sessions)
-    count = ("%s %d" % (quota, len(sessions))) if quota else "%s%d" % (NEUTRAL, len(sessions))
-    return count + (" ⚠%d" % waiting if waiting else "")
+    return "%s  %s" % (quota, counts) if quota else counts
 
 
 def focus_session(pid):
@@ -547,8 +551,8 @@ def settings_dialog(cfg, autostart):
 
     cold = field(118, "Idle interval (minutes):", cfg["cold_minutes"])
     warm = field(88, "Active interval (minutes):", cfg["warm_minutes"])
-    waiting = checkbox(58, "Notify: session needs you", cfg["notify_waiting"])
-    finished = checkbox(32, "Notify: session finished", cfg["notify_finished"])
+    waiting = checkbox(58, "Notify: blocked (permission prompt)", cfg["notify_waiting"])
+    finished = checkbox(32, "Notify: your turn (finished)", cfg["notify_finished"])
     if homebrew_install():
         login = None
         hint = AppKit.NSTextField.labelWithString_("Start at login: brew services start usagebar")
@@ -656,7 +660,7 @@ class Monitor(rumps.App if rumps else object):
             if self.cfg[kind]:
                 state = session_state(session)[1]
                 notify("Claude Code", session_name(session),
-                       "Needs you: %s" % state if kind == "notify_waiting" else "Finished")
+                       "Blocked: %s" % state if kind == "notify_waiting" else "Your turn")
         rows = [(s, self._context(s)) for s in sessions]
         live = {str(s.get("sessionId") or "") for s in sessions}  # same key as _context
         self.contexts = {sid: v for sid, v in self.contexts.items() if sid in live}
@@ -880,16 +884,19 @@ def test():
     assert parse_reset("Sep 17 at 1:40pm", "Not/AZone") is None
     assert parse("nothing here") == {}
 
-    # title: quota bar, session counts, neither
-    sessions = [{"pid": 1, "status": "waiting"}, {"pid": 2, "status": "busy"}, {"pid": 3, "status": "idle"}]
-    assert build_title(quota_title(SAMPLE, None), sessions) == bar(48) + " 3 ⚠1"
+    # title: quota bar, then per-state counts (working, your turn, blocked); empty groups and unknown states hidden
+    sessions = [{"pid": 1, "status": "waiting"}, {"pid": 2, "status": "busy"}, {"pid": 3, "status": "idle"},
+                {"pid": 4, "status": "idle"}, {"pid": 5, "status": "shell"}, {"pid": 6, "status": "blocked"}]
+    assert build_title(quota_title(SAMPLE, None), sessions) == bar(48) + "  ●1 ○3 ⚠1"
+    assert build_title(quota_title(SAMPLE, None), sessions[2:4]) == bar(48) + "  ○2"
     assert build_title(quota_title(SAMPLE, None), []) == bar(48)
-    assert build_title(None, sessions[1:]) == "◉2"
+    assert build_title(quota_title(SAMPLE, None), sessions[5:]) == bar(48)  # only an unknown state: not counted
+    assert build_title(None, sessions[1:3]) == "●1 ○1"
     assert build_title(None, []) == "◉"
     assert build_title(quota_title(None, "claude exited 1"), []) == "⚠︎ Claude"
     # enterprise /usage: no quota lines is not an error
     assert parse(ENTERPRISE) == {} and quota_title(ENTERPRISE, None) is None
-    assert build_title(quota_title(ENTERPRISE, None), sessions) == "◉3 ⚠1"
+    assert build_title(quota_title(ENTERPRISE, None), sessions) == "●1 ○3 ⚠1"
     assert "⚠︎" not in build_title(quota_title(ENTERPRISE, None), [])
     assert no_quota_plan(ENTERPRISE) and not no_quota_plan(SAMPLE) and not no_quota_plan(None)
     # other output without quota lines (expired login, new format) still warns and shows whole
@@ -903,18 +910,27 @@ def test():
 
     # session states: waitingFor text, unknown status shown raw
     assert session_state({"status": "waiting", "waitingFor": "permission prompt"}) == ("⚠", "permission prompt")
-    assert session_state({"status": "waiting"}) == ("⚠", "waiting")
+    assert session_state({"status": "waiting"}) == ("⚠", "blocked")
     assert session_state({"status": "blocked"}) == ("·", "blocked")
-    assert session_row({"pid": 9, "cwd": "/a/proj", "status": "idle"}, "7% context") == "○ proj   7% context   idle"
-    assert session_row({"pid": 9, "name": "x-1", "status": "busy"}, "") == "● x-1   busy"
+    assert session_state({"status": "shell"}) == ("○", "your turn (background shell)")
+    assert session_row({"pid": 9, "cwd": "/a/proj", "status": "idle"}, "7% context") == "○ proj   7% context   your turn"
+    assert session_row({"pid": 9, "name": "x-1", "status": "busy"}, "") == "● x-1   working"
 
     # notifications only on changes seen after the first poll
     before = {1: {"status": "busy"}, 2: {"status": "busy", "statusUpdatedAt": 1000},
-              3: {"status": "waiting"}, 5: {"status": "busy", "statusUpdatedAt": 1000}}
+              3: {"status": "waiting"}, 5: {"status": "busy", "statusUpdatedAt": 1000},
+              6: {"status": "busy", "statusUpdatedAt": 1000}, 7: {"status": "shell", "statusUpdatedAt": 1000},
+              8: {"status": "waiting", "statusUpdatedAt": 1000}, 9: {"status": "waiting", "statusUpdatedAt": 1000}}
     now = [{"pid": 1, "status": "waiting"}, {"pid": 2, "status": "idle", "statusUpdatedAt": 9000},
            {"pid": 3, "status": "waiting"}, {"pid": 4, "status": "waiting"},
-           {"pid": 5, "status": "idle", "statusUpdatedAt": 1700}]  # 0.7 s busy blip (/context): no "Finished"
-    assert [(k, s["pid"]) for k, s in session_events(before, now)] == [("notify_waiting", 1), ("notify_finished", 2)]
+           {"pid": 5, "status": "idle", "statusUpdatedAt": 1700},  # 0.7 s busy blip (/context): no "your turn"
+           {"pid": 6, "status": "shell", "statusUpdatedAt": 4000},  # turn done, background shell runs: your turn
+           {"pid": 7, "status": "idle", "statusUpdatedAt": 9000},  # background shell ended: no second notification
+           {"pid": 8, "status": "idle", "statusUpdatedAt": 1500},  # prompt approved, turn ended between polls
+           {"pid": 9, "status": "shell", "statusUpdatedAt": 1500}]
+    assert [(k, s["pid"]) for k, s in session_events(before, now)] == [
+        ("notify_waiting", 1), ("notify_finished", 2), ("notify_finished", 6),
+        ("notify_finished", 8), ("notify_finished", 9)]
     assert session_events({}, now) == []
 
     import tempfile
@@ -997,11 +1013,17 @@ def test():
     saved_path = CONFIG_PATH
     with tempfile.TemporaryDirectory() as tmp:
         CONFIG_PATH = os.path.join(tmp, "c.json")
-        assert load_config() == DEFAULTS
-        changed = dict(DEFAULTS, notify_waiting=False, notify_finished=True, cold_minutes=9)
+        assert load_config() == DEFAULTS and DEFAULTS["notify_finished"]  # "your turn" on by default
+        with open(CONFIG_PATH, "w") as fh:
+            json.dump({"cold_minutes": 20, "warm_minutes": 5, "notify_waiting": True}, fh)  # 007 file: no key
+        assert load_config()["notify_finished"] is True
+        with open(CONFIG_PATH, "w") as fh:
+            json.dump({"notify_waiting": True, "notify_finished": False}, fh)  # turned off in 007: stays off
+        assert load_config()["notify_finished"] is False
+        changed = dict(DEFAULTS, notify_waiting=False, notify_finished=False, cold_minutes=9)
         save_config(changed)
         assert load_config() == changed
-        save_config(dict(DEFAULTS, notify_waiting="no", notify_finished=1))  # not bools: defaults
+        save_config(dict(DEFAULTS, notify_waiting="no", notify_finished=0))  # not bools: defaults
         assert load_config() == DEFAULTS
     CONFIG_PATH = saved_path
 

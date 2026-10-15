@@ -51,22 +51,24 @@ Uninstall:
 
 ## Menu bar
 
-The bar shows the current session quota (`▰▰▱▱▱ 48%`), then the number of open Claude
-Code sessions and how many need you (`▰▰▱▱▱ 48% 3 ⚠1`). Hover for the reset time, click
+The bar shows the current session quota (`▰▰▱▱▱ 48%`), then the open Claude Code
+sessions counted per state: working, your turn, blocked (`▰▰▱▱▱ 48%  ●1 ○2 ⚠1`).
+States with no sessions are not shown (`▰▰▱▱▱ 48%  ●1 ○2`). Hover for the reset time, click
 for each quota with "in 1h 52m" after its reset time.
 
-Plans without quota lines in `/usage` (enterprise) show the sessions only (`◉3 ⚠1`).
-With no quotas and no sessions the bar shows `◉`.
+Plans without quota lines in `/usage` (enterprise) show the session counts only (`●1 ○2 ⚠1`).
+With nothing to count (no quotas and no counted sessions) the bar shows `◉`.
 
 ### Sessions
 
 The menu lists each open Claude Code session, newest change first:
 `<state> <name>   <context>% context   <status>`.
 
-- `⚠` the session needs you, for example a permission prompt.
-- `●` busy: Claude is working or running a tool.
-- `○` idle: the turn is finished and the session waits for your next message.
-- `·` a status this version does not know; the raw value shows.
+- `●` working: Claude is working or running a tool.
+- `○` your turn: the turn is finished and the session waits for your next message.
+  "your turn (background shell)": a background shell command still runs, but you can type.
+- `⚠` blocked: the session needs you, for example a permission prompt (the row shows why).
+- `·` a status this version does not know; the raw value shows. It is not counted in the bar.
 
 Click a session to bring its terminal to the front. In Terminal.app and iTerm2 its tab
 is selected (macOS asks once for Automation permission). In other apps (Ghostty,
@@ -84,10 +86,10 @@ Settings… holds:
 - Auto start at login: writes `~/Library/LaunchAgents/com.dnlbit.usagebar.plist`
   (unchecking removes it). Takes effect at next login. Homebrew installs have no
   checkbox: use `brew services start usagebar` to start at login.
-- Notify: session needs you (default on): a notification when a session starts to wait
-  for you.
-- Notify: session finished (default off): a notification when a session goes from busy
-  to idle.
+- Notify: blocked (permission prompt) (default on): a notification when a session becomes
+  blocked, for example on a permission prompt.
+- Notify: your turn (finished) (default on): a notification when a session finishes a turn
+  that ran for 2 seconds or more and waits for your reply.
 
 Settings are saved to `~/.config/usagebar.json`. Log: `/tmp/usagebar.log`.
 

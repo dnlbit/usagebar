@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import urllib.request
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -200,7 +201,7 @@ def save_config(cfg):
 def pid_alive(pid):
     try:
         os.kill(pid, 0)
-    except ProcessLookupError:
+    except (ProcessLookupError, OverflowError):  # OverflowError: pid too big for the OS (broken file)
         return False
     except PermissionError:  # alive, owned by another user
         return True
@@ -208,7 +209,7 @@ def pid_alive(pid):
 
 
 def read_sessions(directory=SESSIONS_DIR, alive=pid_alive, previous=None):
-    """Live interactive sessions, newest status change first. Files of crashed sessions stay
+    """Live interactive sessions, newest start first (stable, so status changes retitle in place). Files of crashed sessions stay
     behind: a dead pid drops them. previous (pid -> session from the last poll) stands in for
     a file caught mid-write, so the session does not vanish and come back as new.
     shortcut: a reused pid shows a stale file; compare procStart if that bites."""
@@ -228,7 +229,7 @@ def read_sessions(directory=SESSIONS_DIR, alive=pid_alive, previous=None):
             continue
         if pid > 0 and alive(pid):
             out.append(session)
-    return sorted(out, key=lambda s: s.get("statusUpdatedAt") or 0, reverse=True)
+    return sorted(out, key=lambda s: (s.get("startedAt") or 0, s["pid"]), reverse=True)
 
 
 def session_state(session):
@@ -266,10 +267,15 @@ def notify(title, subtitle, message):
         return
     except Exception as exc:
         log("notify via rumps: %s" % exc)
+    # off the main thread, like _focus: osascript must never stall the menu
+    threading.Thread(target=notify_osascript, args=(title, subtitle, message), daemon=True).start()
+
+
+def notify_osascript(title, subtitle, message):
     try:
         proc = subprocess.run(["osascript", "-e", NOTIFY_SCRIPT, title, subtitle, message],
                               capture_output=True, text=True, timeout=5)
-    except subprocess.TimeoutExpired:  # runs on the main thread: never hang the menu
+    except subprocess.TimeoutExpired:
         log("notify via osascript: timed out")
         return
     if proc.returncode:
@@ -286,14 +292,20 @@ def session_name(session):
 
 
 def transcript_path(session_id):
-    """Path of a session's transcript, or None. session_id must already be validated."""
+    """Path of a session's transcript, or None (also for an id with characters other than word chars and -)."""
+    if not re.fullmatch(r"[\w-]+", session_id):  # keeps the glob inside PROJECTS
+        return None
     hits = glob.glob(os.path.join(PROJECTS, "*", session_id + ".jsonl"))
     return hits[0] if hits else None
 
 
-def last_usage(path):
+TAIL_MAX = 4 * 1024 * 1024  # the menu runs on the main thread: never read whole multi-MB transcripts
+CONTEXT_EVERY, MISSING_EVERY = 10, 30  # seconds between context reads / transcript lookups per session
+
+
+def last_usage(path, max_bytes=TAIL_MAX):
     """(usage, model) of the last main-thread reply in a transcript, or None.
-    Reads from the end, growing the window up to the last 4 MB."""
+    Reads from the end, growing the window up to the last max_bytes (None: the whole file)."""
     size = os.path.getsize(path)
     chunk = 256 * 1024
     while True:
@@ -313,12 +325,11 @@ def last_usage(path):
             if (entry.get("type") == "assistant" and not entry.get("isSidechain")
                     and msg.get("usage") and msg.get("model") != "<synthetic>"):
                 return msg["usage"], msg.get("model")
-        if chunk >= size or chunk >= TAIL_MAX:
+        if chunk >= size or (max_bytes is not None and chunk >= max_bytes):
             return None
         chunk *= 4
 
 
-TAIL_MAX = 4 * 1024 * 1024  # runs on the main thread: never read whole multi-MB transcripts
 
 
 def context_tokens(usage):
@@ -573,9 +584,10 @@ class Monitor(rumps.App if rumps else object):
         self.sessions = []  # (session, context label) from the last poll
         self.session_items = []  # their menu items, retitled in place when only text changes
         self.known = None  # pid -> session at the last poll; None until the first one
-        self.contexts = {}  # sessionId -> (transcript path, mtime, context label)
+        self.contexts = {}  # sessionId -> (transcript path, mtime, context label, monotonic time checked, status)
         self.quota = None  # quota part of the title
         self.logged_text = None  # last /usage text logged as having no quota lines
+        self.no_quota = False  # last fetch: a plan without quotas (enterprise)
         self.status_item = rumps.MenuItem("", callback=noop)
         self.settings_item = rumps.MenuItem("Settings\u2026", callback=self.open_settings)
         self.update_tag = None  # newer release found by _update_checker
@@ -646,7 +658,7 @@ class Monitor(rumps.App if rumps else object):
                 notify("Claude Code", session_name(session),
                        "Needs you: %s" % state if kind == "notify_waiting" else "Finished")
         rows = [(s, self._context(s)) for s in sessions]
-        live = {str(s.get("sessionId")) for s in sessions}
+        live = {str(s.get("sessionId") or "") for s in sessions}  # same key as _context
         self.contexts = {sid: v for sid, v in self.contexts.items() if sid in live}
         titles = [session_row(s, ctx) for s, ctx in rows]
         if titles == [session_row(s, ctx) for s, ctx in self.sessions]:
@@ -663,11 +675,15 @@ class Monitor(rumps.App if rumps else object):
                 self.dirty = True
 
     def _context(self, session):
-        """Context label, recomputed only when the transcript's mtime changed."""
+        """Context label, recomputed only when the transcript's mtime changed, at most every
+        CONTEXT_EVERY s; a transcript not found is looked up again after MISSING_EVERY s, or at
+        once when the session's status changes (a new session's first reply creates it)."""
         sid = str(session.get("sessionId") or "")
-        if not re.fullmatch(r"[\w-]+", sid):  # keeps the glob inside PROJECTS
-            return ""
-        path, mtime, label = self.contexts.get(sid, (None, None, ""))
+        path, mtime, label, checked, status = self.contexts.get(sid, (None, None, "", None, None))
+        now = time.monotonic()
+        if (checked is not None and now - checked < (CONTEXT_EVERY if path else MISSING_EVERY)
+                and (path or status == session.get("status"))):
+            return label
         try:
             path = path or transcript_path(sid)
             if path and os.path.getmtime(path) != mtime:
@@ -676,7 +692,7 @@ class Monitor(rumps.App if rumps else object):
         except OSError as exc:  # transcript moved or deleted
             log("context %s: %s" % (sid, exc))
             path = None
-        self.contexts[sid] = (path, mtime, label)
+        self.contexts[sid] = (path, mtime, label, now, session.get("status"))
         return label
 
     def _focus(self, pid):
@@ -706,13 +722,15 @@ class Monitor(rumps.App if rumps else object):
         self.session = stats.get("Current session")
         self.quota = quota_title(text, error)
         self.title = build_title(self.quota, [s for s, _ in self.sessions])
-        if text and not self.session and text != self.logged_text:  # once per new text, not per rebuild
+        self.no_quota = not error and no_quota_plan(text)
+        # enterprise text changes on every fetch (request counts): its missing quota line is expected
+        if text and not self.session and not self.no_quota and text != self.logged_text:  # once per new text, not per rebuild
             self.logged_text = text
             log("no session quota line in %r" % text[:300])
         if error:
             for line in error.splitlines():
                 add(line)
-        elif no_quota_plan(text):  # e.g. an enterprise plan: nothing to show, not an error
+        elif self.no_quota:  # e.g. an enterprise plan: nothing to show, not an error
             pass
         elif text:
             for line in menu_lines(text):
@@ -747,7 +765,7 @@ class Monitor(rumps.App if rumps else object):
     def _refresh_tooltip(self):
         session = getattr(self, "session", None)
         if not session:
-            tip = "Claude usage unavailable"
+            tip = "No usage quotas on this plan" if self.no_quota else "Claude usage unavailable"
         elif session[1]:
             tip = "%d%% used · resets %s" % (session[0], humanize(session[1]))
         else:
@@ -772,6 +790,7 @@ class Monitor(rumps.App if rumps else object):
         result = settings_dialog(self.cfg, autostart_enabled())
         if result is None:
             return
+        interval = self.interval()
         self.cfg, autostart = result
         save_config(self.cfg)
         try:
@@ -781,7 +800,8 @@ class Monitor(rumps.App if rumps else object):
             log("autostart: %s" % exc)
             rumps.alert("Could not change auto start", str(exc))
         self._refresh_status()
-        self.wake.set()  # refetch now and restart the wait with the new interval
+        if self.interval() != interval:
+            self.wake.set()  # refetch now and restart the wait with the new interval
 
 
 SAMPLE = """You are currently using your subscription to power your Claude Code usage
@@ -902,18 +922,19 @@ def test():
         def write(name, data):
             with open(os.path.join(tmp, name), "w") as fh:
                 fh.write(data if isinstance(data, str) else json.dumps(data))
-        write("1.json", {"pid": 1, "status": "idle", "statusUpdatedAt": 5})
-        write("2.json", {"pid": 2, "status": "blocked", "statusUpdatedAt": 9})
+        write("1.json", {"pid": 1, "status": "idle", "startedAt": 5, "statusUpdatedAt": 99})
+        write("2.json", {"pid": 2, "status": "blocked", "startedAt": 9, "statusUpdatedAt": 1})
         write("3.json", {"pid": 3, "status": "busy"})  # crashed: pid dead
         write("4.json", '{"pid": 4, "sta')  # mid-write
         write("4.key", "x")
         got = read_sessions(tmp, alive=lambda pid: pid != 3)
-        assert [s["pid"] for s in got] == [2, 1], got
+        assert [s["pid"] for s in got] == [2, 1], got  # newest start first, not newest status change
         write("5.json", {"pid": 2 ** 22 + 12345, "status": "idle"})  # real check: no such pid
         write("6.json", {"pid": os.getpid(), "status": "idle"})
+        write("9.json", {"pid": 2 ** 70, "status": "idle"})  # too big for kill(): dropped, no OverflowError
         assert sorted(s["pid"] for s in read_sessions(tmp) if s["pid"] > 4) == [os.getpid()]
         # a file caught mid-write keeps the last good copy, so the pid does not come back as "new"
-        for name in ("5.json", "6.json"):
+        for name in ("5.json", "6.json", "9.json"):
             os.remove(os.path.join(tmp, name))
         write("7.json", {"pid": "7", "kind": "interactive", "status": "busy"})
         write("8.json", {"pid": 8, "kind": "sdk-cli", "status": "busy"})  # not an interactive session
@@ -941,6 +962,35 @@ def test():
         # the tail read stops at TAIL_MAX: a reply further back is not found (the app keeps the last value)
         write("far.jsonl", json.dumps(reply) + "\n" + ('{"type": "user", "pad": "%s"}\n' % ("x" * 1000)) * 5000)
         assert context_label(os.path.join(tmp, "far.jsonl")) == ""
+        assert last_usage(os.path.join(tmp, "far.jsonl")) is None
+        assert last_usage(os.path.join(tmp, "far.jsonl"), None)[1] == "unknown"  # max_bytes=None: whole file
+
+        # context reads are throttled per session; a missing transcript is looked up again later
+        global PROJECTS
+        saved_projects, PROJECTS = PROJECTS, tmp
+        os.makedirs(os.path.join(tmp, "p"))
+        os.replace(os.path.join(tmp, "u.jsonl"), os.path.join(tmp, "p", "u.jsonl"))
+        assert transcript_path("u") and transcript_path("../p/u") is None
+        clock = [100.0]
+        saved_monotonic, time.monotonic = time.monotonic, lambda: clock[0]
+        try:
+            fake = type("M", (), {"contexts": {}})()
+            ctx = lambda sid, status="idle": Monitor._context(fake, {"sessionId": sid, "status": status})
+            assert ctx("u") == "70k context" and ctx("gone") == "" and ctx("new") == "" and ctx("../x") == ""
+            reply["message"]["usage"]["input_tokens"] = 10_003
+            write("p/u.jsonl", json.dumps(reply))
+            write("p/gone.jsonl", json.dumps(reply))
+            write("p/new.jsonl", json.dumps(reply))
+            os.utime(os.path.join(tmp, "p", "u.jsonl"), (1, 1))  # new mtime
+            clock[0] += 9
+            assert ctx("u") == "70k context" and ctx("gone") == ""  # within 10 s / 30 s: cached
+            assert ctx("new", "busy") == "80k context"  # status changed: missing cache dropped
+            clock[0] += 1
+            assert ctx("u") == "80k context" and ctx("gone") == ""
+            clock[0] += 20
+            assert ctx("gone") == "80k context"
+        finally:
+            time.monotonic, PROJECTS = saved_monotonic, saved_projects
 
     # notification toggles are kept as booleans next to the intervals
     global CONFIG_PATH

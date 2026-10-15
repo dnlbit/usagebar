@@ -81,7 +81,7 @@ def get_context_size(args):
     path = find_transcript(args.get("session_id"))
     if not path:
         raise ToolError("Transcript not found")
-    found = monitor.last_usage(path)
+    found = monitor.last_usage(path, max_bytes=None)  # full scan: an agent asks rarely
     if not found:
         raise ToolError("No replies in this transcript yet")
     usage, model = found
@@ -187,6 +187,10 @@ def test():
         fh.write(json.dumps(rows[0]))
     got = get_context_size({"session_id": "abc-2"})
     assert (got["window_tokens"], got["percent_used"]) == (1_000_000, 7.0), got
+    # a reply more than 4 MB from the end is still found (full scan, unlike the menu's tail read)
+    with open(os.path.join(PROJECTS, "-proj", "abc-3.jsonl"), "w") as fh:
+        fh.write(json.dumps(rows[0]) + "\n" + ('{"type": "user", "pad": "%s"}\n' % ("x" * 1000)) * 5000)
+    assert get_context_size({"session_id": "abc-3"})["percent_used"] == 7.0
     for bad in ("../x", "nope"):
         try:
             get_context_size({"session_id": bad})

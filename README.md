@@ -51,8 +51,30 @@ Uninstall:
 
 ## Menu bar
 
-The bar shows the current session quota (`▰▰▱▱▱ 48%`). Hover for the reset time, click
+The bar shows the current session quota (`▰▰▱▱▱ 48%`), then the number of open Claude
+Code sessions and how many need you (`▰▰▱▱▱ 48% 3 ⚠1`). Hover for the reset time, click
 for each quota with "in 1h 52m" after its reset time.
+
+Plans without quota lines in `/usage` (enterprise) show the sessions only (`◉3 ⚠1`).
+With no quotas and no sessions the bar shows `◉`.
+
+### Sessions
+
+The menu lists each open Claude Code session, newest change first:
+`<state> <name>   <context>% context   <status>`.
+
+- `⚠` the session needs you, for example a permission prompt.
+- `●` busy: Claude is working or running a tool.
+- `○` idle: the turn is finished and the session waits for your next message.
+- `·` a status this version does not know; the raw value shows.
+
+Click a session to bring its terminal to the front. In Terminal.app and iTerm2 its tab
+is selected (macOS asks once for Automation permission). In other apps (Ghostty,
+VS Code, Cursor, Warp…) the app only comes to the front.
+
+Session data comes from `~/.claude/sessions/*.json` and the transcripts in
+`~/.claude/projects`. Claude Code does not document these files, so a Claude Code
+update can change or break this part.
 
 Settings… holds:
 
@@ -62,8 +84,12 @@ Settings… holds:
 - Auto start at login: writes `~/Library/LaunchAgents/com.dnlbit.usagebar.plist`
   (unchecking removes it). Takes effect at next login. Homebrew installs have no
   checkbox: use `brew services start usagebar` to start at login.
+- Notify: session needs you (default on): a notification when a session starts to wait
+  for you.
+- Notify: session finished (default off): a notification when a session goes from busy
+  to idle.
 
-Intervals are saved to `~/.config/usagebar.json`. Log: `/tmp/usagebar.log`.
+Settings are saved to `~/.config/usagebar.json`. Log: `/tmp/usagebar.log`.
 
 ## MCP tool
 
@@ -74,7 +100,7 @@ Intervals are saved to `~/.config/usagebar.json`. Log: `/tmp/usagebar.log`.
   0 forces it), the tool runs `claude -p /usage` itself (about 2s), so it works
   without the app. `fetched_at` says how fresh it is.
 - `context`: tokens in the calling Claude Code session's context, the model's max
-  window (hard-coded table in `mcp_server.py`) and percent used.
+  window (hard-coded table in `monitor.py`) and percent used.
 
 Either part comes back as `{"error": ...}` on its own if it fails. Example (`text`,
 the raw `/usage` output, shortened):

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""macOS menu bar monitor for Claude Code usage quota (`claude -p /usage`)."""
+"""macOS menu bar monitor for Claude Code usage quota (`claude -p /usage`) and open sessions."""
 
+import glob
 import json
 import os
 import plistlib
@@ -27,9 +28,24 @@ STATE_PATH = os.path.expanduser("~/.cache/usagebar/last.json")  # read by mcp_se
 LABEL = "com.dnlbit.usagebar"
 PLIST_DST = os.path.expanduser("~/Library/LaunchAgents/%s.plist" % LABEL)
 # cold: poll slowly while usage is flat; warm: poll faster after a change
-DEFAULTS = {"cold_minutes": 20, "warm_minutes": 5}
+DEFAULTS = {"cold_minutes": 20, "warm_minutes": 5, "notify_waiting": True, "notify_finished": False}
 SEGMENTS = 5
 FILLED, EMPTY = "▰", "▱"
+NEUTRAL = "◉"
+# Live sessions: undocumented Claude Code files, one per running session (<pid>.json)
+SESSIONS_DIR = os.path.expanduser("~/.claude/sessions")
+PROJECTS = os.path.expanduser("~/.claude/projects")
+# Model max context windows (Anthropic docs). Claude Code auto-compacts earlier (500k for Opus 5.5).
+WINDOWS = {
+    model: 1_000_000 for model in (
+        "claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8",
+        "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6",
+        "claude-haiku-5-5",
+    )
+}
+# Seen on Claude Code 2.1.299 (2026-10-15): running a tool -> "busy"; permission prompt ->
+# "waiting" with waitingFor "permission prompt"; turn finished, waiting for the user -> "idle".
+STATE_ICONS = {"waiting": "⚠", "busy": "●", "idle": "○"}
 
 LINE_RE = re.compile(
     r"^(Current session|Current week \([^)]+\)): (\d+)% used(?: · resets (.+?) \((.+?)\))?$",
@@ -164,8 +180,12 @@ def load_config():
     try:
         with open(CONFIG_PATH) as fh:
             saved = json.load(fh)
-        for key in DEFAULTS:
-            cfg[key] = minutes(saved.get(key, cfg[key]), cfg[key])
+        for key, default in DEFAULTS.items():
+            value = saved.get(key, default)
+            if isinstance(default, bool):
+                cfg[key] = value if isinstance(value, bool) else default
+            else:
+                cfg[key] = minutes(value, default)
     except Exception:
         pass
     return cfg
@@ -175,6 +195,254 @@ def save_config(cfg):
     os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
     with open(CONFIG_PATH, "w") as fh:
         json.dump(cfg, fh)
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # alive, owned by another user
+        return True
+    return True
+
+
+def read_sessions(directory=SESSIONS_DIR, alive=pid_alive, previous=None):
+    """Live interactive sessions, newest status change first. Files of crashed sessions stay
+    behind: a dead pid drops them. previous (pid -> session from the last poll) stands in for
+    a file caught mid-write, so the session does not vanish and come back as new.
+    shortcut: a reused pid shows a stale file; compare procStart if that bites."""
+    out = []
+    for path in glob.glob(os.path.join(directory, "*.json")):
+        try:
+            with open(path) as fh:
+                session = json.load(fh)
+            session["pid"] = pid = int(session["pid"])
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):  # mid-write or not a session file
+            name = os.path.basename(path)[:-len(".json")]
+            session = (previous or {}).get(int(name)) if name.isdigit() else None
+            if session is None:
+                continue
+            pid = session["pid"]
+        if session.get("kind", "interactive") != "interactive":
+            continue
+        if pid > 0 and alive(pid):
+            out.append(session)
+    return sorted(out, key=lambda s: s.get("statusUpdatedAt") or 0, reverse=True)
+
+
+def session_state(session):
+    """(icon, text) for a session's status; unknown values show raw so new states do not break the menu."""
+    status = session.get("status") or "?"
+    if status == "waiting":
+        return STATE_ICONS[status], session.get("waitingFor") or status
+    return STATE_ICONS.get(status, "·"), status
+
+
+def session_events(previous, sessions):
+    """(kind, session) for status changes since the last poll. previous maps pid -> session;
+    sessions not in it are new (or the app just started) and never notify. A busy spell
+    under 2 s (e.g. /context) is not a finished turn."""
+    events = []
+    for session in sessions:
+        if session["pid"] not in previous:
+            continue
+        before = previous[session["pid"]]
+        old, new = before.get("status"), session.get("status")
+        if new == "waiting" and old != "waiting":
+            events.append(("notify_waiting", session))
+        elif old == "busy" and new == "idle":
+            busy_ms = (session.get("statusUpdatedAt") or 0) - (before.get("statusUpdatedAt") or 0)
+            if busy_ms >= 2000:
+                events.append(("notify_finished", session))
+    return events
+
+
+def notify(title, subtitle, message):
+    """Post a notification. rumps needs a bundle id on the Python it runs under; without
+    one, osascript posts it instead (as Script Editor). Text goes as argv, never into the script."""
+    try:
+        rumps.notification(title, subtitle, message)
+        return
+    except Exception as exc:
+        log("notify via rumps: %s" % exc)
+    try:
+        proc = subprocess.run(["osascript", "-e", NOTIFY_SCRIPT, title, subtitle, message],
+                              capture_output=True, text=True, timeout=5)
+    except subprocess.TimeoutExpired:  # runs on the main thread: never hang the menu
+        log("notify via osascript: timed out")
+        return
+    if proc.returncode:
+        log("notify via osascript: %s" % proc.stderr.strip())
+
+
+NOTIFY_SCRIPT = """on run argv
+    display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)
+end run"""
+
+
+def session_name(session):
+    return session.get("name") or os.path.basename(session.get("cwd") or "") or str(session["pid"])
+
+
+def transcript_path(session_id):
+    """Path of a session's transcript, or None. session_id must already be validated."""
+    hits = glob.glob(os.path.join(PROJECTS, "*", session_id + ".jsonl"))
+    return hits[0] if hits else None
+
+
+def last_usage(path):
+    """(usage, model) of the last main-thread reply in a transcript, or None.
+    Reads from the end, growing the window up to the last 4 MB."""
+    size = os.path.getsize(path)
+    chunk = 256 * 1024
+    while True:
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - chunk))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+        if chunk < size:
+            lines = lines[1:]  # cut mid-line by the seek
+        for line in reversed(lines):
+            if '"assistant"' not in line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:  # last line may still be mid-write
+                continue
+            msg = entry.get("message") or {}
+            if (entry.get("type") == "assistant" and not entry.get("isSidechain")
+                    and msg.get("usage") and msg.get("model") != "<synthetic>"):
+                return msg["usage"], msg.get("model")
+        if chunk >= size or chunk >= TAIL_MAX:
+            return None
+        chunk *= 4
+
+
+TAIL_MAX = 4 * 1024 * 1024  # runs on the main thread: never read whole multi-MB transcripts
+
+
+def context_tokens(usage):
+    keys = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
+    return sum(usage.get(k) or 0 for k in keys)
+
+
+def context_label(path):
+    """'7% context', '117k context' for an unknown model, or '' before the first reply."""
+    found = last_usage(path)
+    if not found:
+        return ""
+    tokens, window = context_tokens(found[0]), WINDOWS.get(found[1])
+    return "%d%% context" % round(tokens * 100 / window) if window else "%dk context" % round(tokens / 1000)
+
+
+def session_row(session, context):
+    icon, state = session_state(session)
+    return "   ".join(part for part in ("%s %s" % (icon, session_name(session)), context, state) if part)
+
+
+def no_quota_plan(text):
+    """True for /usage output of a plan without limits (enterprise): the known header or
+    breakdown and no quota lines. Other output without quota lines (expired login, a new
+    format) is not this and still shows a warning."""
+    # Pro/Max output has the same header: any "% used" means quotas in a format we do not parse
+    return bool(text) and not parse(text) and "% used" not in text and (
+        "You are currently using your subscription" in text or "What's contributing to your" in text)
+
+
+def quota_title(text, error):
+    """Quota part of the title: the session bar, a warning on a failed fetch or unknown
+    output, or None for a plan without quotas or before the first fetch."""
+    session = parse(text).get("Current session") if text else None
+    if session:
+        return bar(session[0])
+    if error or (text and not no_quota_plan(text)):
+        return "\u26a0\ufe0e Claude"
+    return None
+
+
+def build_title(quota, sessions):
+    """'▰▰▱▱▱ 48% 3 ⚠1', '◉3 ⚠1' without quotas, '◉' with neither."""
+    if not sessions:
+        return quota or NEUTRAL
+    waiting = sum(s.get("status") == "waiting" for s in sessions)
+    count = ("%s %d" % (quota, len(sessions))) if quota else "%s%d" % (NEUTRAL, len(sessions))
+    return count + (" ⚠%d" % waiting if waiting else "")
+
+
+def focus_session(pid):
+    """Bring the session's terminal to the front: its tab in Terminal.app or iTerm2,
+    else just the app that owns it. Runs osascript, so call it off the main thread."""
+    try:
+        tty = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+        app, parent = None, pid
+        while parent > 1 and app is None:
+            parent = int(subprocess.run(["ps", "-o", "ppid=", "-p", str(parent)],
+                                        capture_output=True, text=True).stdout.strip() or 0)
+            found = AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(parent)
+            if found and found.activationPolicy() == AppKit.NSApplicationActivationPolicyRegular:
+                app = found
+    except (OSError, ValueError) as exc:
+        log("focus %d: %s" % (pid, exc))
+        return
+    if app is None:
+        log("focus %d: no terminal app found" % pid)
+        return
+    bundle = app.bundleIdentifier() or ""
+    # the tab script for Terminal/iTerm2, else activate the app: osascript does it from a
+    # background app, where macOS 14+ ignores NSRunningApplication.activate
+    for script, arg in ((FOCUS_SCRIPTS.get(bundle), "/dev/" + tty), (ACTIVATE_SCRIPT, bundle)):
+        if not script or arg in ("/dev/", "/dev/??"):
+            continue
+        try:
+            proc = subprocess.run(["osascript", "-e", script, arg], capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:  # Automation permission dialog left open
+            log("focus %d: osascript timed out" % pid)
+            return
+        if proc.returncode == 0:
+            return
+        log("focus %d: %s" % (pid, proc.stderr.strip()))
+
+
+ACTIVATE_SCRIPT = """on run argv
+    tell application id (item 1 of argv) to activate
+end run"""
+
+
+FOCUS_SCRIPTS = {
+    "com.apple.Terminal": """on run argv
+    tell application "Terminal"
+        repeat with w in windows
+            repeat with t in tabs of w
+                if tty of t is item 1 of argv then
+                    set selected of t to true
+                    set index of w to 1
+                    activate
+                    return
+                end if
+            end repeat
+        end repeat
+    end tell
+    error "tty not found"
+end run""",
+    "com.googlecode.iterm2": """on run argv
+    tell application "iTerm2"
+        repeat with w in windows
+            repeat with t in tabs of w
+                repeat with s in sessions of t
+                    if tty of s is item 1 of argv then
+                        select w
+                        tell t to select
+                        tell s to select
+                        activate
+                        return
+                    end if
+                end repeat
+            end repeat
+        end repeat
+    end tell
+    error "tty not found"
+end run""",
+}
 
 
 def autostart_enabled():
@@ -248,7 +516,7 @@ def settings_dialog(cfg, autostart):
                               "polls every active interval until it goes flat again.")
     alert.addButtonWithTitle_("Save")
     alert.addButtonWithTitle_("Cancel")
-    view = AppKit.NSView.alloc().initWithFrame_(((0, 0), (280, 92)))
+    view = AppKit.NSView.alloc().initWithFrame_(((0, 0), (280, 144)))
 
     def field(y, label, value):
         text = AppKit.NSTextField.labelWithString_(label)
@@ -259,8 +527,17 @@ def settings_dialog(cfg, autostart):
         view.addSubview_(box)
         return box
 
-    cold = field(66, "Idle interval (minutes):", cfg["cold_minutes"])
-    warm = field(36, "Active interval (minutes):", cfg["warm_minutes"])
+    def checkbox(y, label, on):
+        box = AppKit.NSButton.checkboxWithTitle_target_action_(label, None, None)
+        box.setFrame_(((0, y), (280, 22)))
+        box.setState_(1 if on else 0)
+        view.addSubview_(box)
+        return box
+
+    cold = field(118, "Idle interval (minutes):", cfg["cold_minutes"])
+    warm = field(88, "Active interval (minutes):", cfg["warm_minutes"])
+    waiting = checkbox(58, "Notify: session needs you", cfg["notify_waiting"])
+    finished = checkbox(32, "Notify: session finished", cfg["notify_finished"])
     if homebrew_install():
         login = None
         hint = AppKit.NSTextField.labelWithString_("Start at login: brew services start usagebar")
@@ -268,10 +545,7 @@ def settings_dialog(cfg, autostart):
         hint.setFrame_(((0, 2), (280, 22)))
         view.addSubview_(hint)
     else:
-        login = AppKit.NSButton.checkboxWithTitle_target_action_("Auto start at login", None, None)
-        login.setFrame_(((0, 2), (280, 22)))
-        login.setState_(1 if autostart else 0)
-        view.addSubview_(login)
+        login = checkbox(2, "Auto start at login", autostart)
     alert.setAccessoryView_(view)
     alert.window().setInitialFirstResponder_(cold)
     if alert.runModal() != AppKit.NSAlertFirstButtonReturn:
@@ -279,6 +553,8 @@ def settings_dialog(cfg, autostart):
     new = {
         "cold_minutes": minutes(cold.stringValue(), cfg["cold_minutes"]),
         "warm_minutes": minutes(warm.stringValue(), cfg["warm_minutes"]),
+        "notify_waiting": waiting.state() == 1,
+        "notify_finished": finished.state() == 1,
     }
     return new, None if login is None else login.state() == 1
 
@@ -294,6 +570,12 @@ class Monitor(rumps.App if rumps else object):
         self.wake = threading.Event()
         self.live = []  # (MenuItem, base title, reset datetime)
         self.session = None
+        self.sessions = []  # (session, context label) from the last poll
+        self.session_items = []  # their menu items, retitled in place when only text changes
+        self.known = None  # pid -> session at the last poll; None until the first one
+        self.contexts = {}  # sessionId -> (transcript path, mtime, context label)
+        self.quota = None  # quota part of the title
+        self.logged_text = None  # last /usage text logged as having no quota lines
         self.status_item = rumps.MenuItem("", callback=noop)
         self.settings_item = rumps.MenuItem("Settings\u2026", callback=self.open_settings)
         self.update_tag = None  # newer release found by _update_checker
@@ -303,6 +585,7 @@ class Monitor(rumps.App if rumps else object):
         if updates_enabled():
             threading.Thread(target=self._update_checker, daemon=True).start()
         rumps.Timer(self._tick, 1).start()
+        rumps.Timer(self._poll_sessions, 2).start()
 
     # background --------------------------------------------------------
     def interval(self):
@@ -345,45 +628,106 @@ class Monitor(rumps.App if rumps else object):
             failed, self.update_failed = self.update_failed, False
         if failed:
             rumps.alert("Update failed", "Details are in %s" % LOG_PATH)
-        if result is None:
-            return
         if dirty:
-            self._rebuild(*result)
+            self._rebuild(*(result or (None, None)))
         for item, base, reset in self.live:
             item.title = "%s  ·  %s" % (base, humanize(reset))
         self._refresh_tooltip()
 
+    def _poll_sessions(self, _):
+        """Every 2 s: re-read the session files; rebuild the menu only when a row changed."""
+        sessions = read_sessions(previous=self.known)
+        # first poll: sessions already waiting at app start do not notify
+        events = session_events(self.known, sessions) if self.known is not None else []
+        self.known = {s["pid"]: s for s in sessions}  # before notifying: a failure must not repeat it
+        for kind, session in events:
+            if self.cfg[kind]:
+                state = session_state(session)[1]
+                notify("Claude Code", session_name(session),
+                       "Needs you: %s" % state if kind == "notify_waiting" else "Finished")
+        rows = [(s, self._context(s)) for s in sessions]
+        live = {str(s.get("sessionId")) for s in sessions}
+        self.contexts = {sid: v for sid, v in self.contexts.items() if sid in live}
+        titles = [session_row(s, ctx) for s, ctx in rows]
+        if titles == [session_row(s, ctx) for s, ctx in self.sessions]:
+            return
+        same_pids = [s["pid"] for s, _ in rows] == [s["pid"] for s, _ in self.sessions]
+        self.sessions = rows
+        if same_pids and len(self.session_items) == len(rows):
+            # same rows, new text: retitle in place so an open menu does not flicker
+            for item, title in zip(self.session_items, titles):
+                item.title = title
+            self.title = build_title(self.quota, sessions)
+        else:
+            with self.lock:
+                self.dirty = True
+
+    def _context(self, session):
+        """Context label, recomputed only when the transcript's mtime changed."""
+        sid = str(session.get("sessionId") or "")
+        if not re.fullmatch(r"[\w-]+", sid):  # keeps the glob inside PROJECTS
+            return ""
+        path, mtime, label = self.contexts.get(sid, (None, None, ""))
+        try:
+            path = path or transcript_path(sid)
+            if path and os.path.getmtime(path) != mtime:
+                # nothing found in the tail (long tool output): keep the last value
+                mtime, label = os.path.getmtime(path), context_label(path) or label
+        except OSError as exc:  # transcript moved or deleted
+            log("context %s: %s" % (sid, exc))
+            path = None
+        self.contexts[sid] = (path, mtime, label)
+        return label
+
+    def _focus(self, pid):
+        threading.Thread(target=focus_session, args=(pid,), daemon=True).start()
+
     def _rebuild(self, text, error):
         self.live = []
         items = []
-        if error:
-            self.title = "⚠︎ Claude"
-            self.session = None
-            items = [rumps.MenuItem(line, callback=noop) for line in error.splitlines()]
+        seen = set()
+
+        def add(title, callback=noop):
+            while title in seen:  # rumps keys menu items by title
+                title += " "
+            seen.add(title)
+            item = rumps.MenuItem(title, callback=callback)
+            items.append(item)
+            return item
+
+        if self.sessions:
+            add("Sessions")
+            self.session_items = [add(session_row(session, context), lambda _, pid=session["pid"]: self._focus(pid))
+                                  for session, context in self.sessions]
+            items.append(None)
         else:
-            stats = parse(text)
-            self.session = stats.get("Current session")
-            if not self.session:  # unrecognised output: show it, do not hide it
-                log("parse failed on %r" % text[:300])
-                self.title = "\u26a0\ufe0e Claude"
-            else:
-                self.title = bar(self.session[0])
-            seen = set()
+            self.session_items = []
+        stats = parse(text) if text else {}
+        self.session = stats.get("Current session")
+        self.quota = quota_title(text, error)
+        self.title = build_title(self.quota, [s for s, _ in self.sessions])
+        if text and not self.session and text != self.logged_text:  # once per new text, not per rebuild
+            self.logged_text = text
+            log("no session quota line in %r" % text[:300])
+        if error:
+            for line in error.splitlines():
+                add(line)
+        elif no_quota_plan(text):  # e.g. an enterprise plan: nothing to show, not an error
+            pass
+        elif text:
             for line in menu_lines(text):
                 title = line.rstrip()
                 if not title:
                     items.append(None)  # blank line -> separator
                     continue
-                while title in seen:  # rumps keys menu items by title
-                    title += " "
-                seen.add(title)
-                item = rumps.MenuItem(title, callback=noop)
+                item = add(title)
                 match = LINE_RE.match(line)
                 if match and stats[match.group(1)][1]:
-                    self.live.append((item, title, stats[match.group(1)][1]))
-                items.append(item)
+                    self.live.append((item, item.title, stats[match.group(1)][1]))
+        if items and items[-1] is None:
+            items.pop()
         self._refresh_status()
-        items += [None, self.status_item]
+        items += ([None] if items else []) + [self.status_item]
         if self.updating:
             items.append(rumps.MenuItem("Updating\u2026"))  # no callback: greyed out, cannot start twice
         elif self.update_tag:
@@ -449,6 +793,14 @@ Last 24h · 160 requests · 3 sessions
   65% of your usage was at >150k context
 """
 
+# enterprise plan (owner's work machine, 2026-10-15): no quota lines at all
+ENTERPRISE = """You are currently using your subscription to power your Claude Code usage
+
+What's contributing to your usage
+Last 24h · 212 requests · 4 sessions
+  58% of your usage was at >150k context
+"""
+
 
 def test():
     stats = parse(SAMPLE)
@@ -508,8 +860,102 @@ def test():
     assert parse_reset("Sep 17 at 1:40pm", "Not/AZone") is None
     assert parse("nothing here") == {}
 
-    # install kind: Homebrew runs us through an opt symlink into the Cellar
+    # title: quota bar, session counts, neither
+    sessions = [{"pid": 1, "status": "waiting"}, {"pid": 2, "status": "busy"}, {"pid": 3, "status": "idle"}]
+    assert build_title(quota_title(SAMPLE, None), sessions) == bar(48) + " 3 ⚠1"
+    assert build_title(quota_title(SAMPLE, None), []) == bar(48)
+    assert build_title(None, sessions[1:]) == "◉2"
+    assert build_title(None, []) == "◉"
+    assert build_title(quota_title(None, "claude exited 1"), []) == "⚠︎ Claude"
+    # enterprise /usage: no quota lines is not an error
+    assert parse(ENTERPRISE) == {} and quota_title(ENTERPRISE, None) is None
+    assert build_title(quota_title(ENTERPRISE, None), sessions) == "◉3 ⚠1"
+    assert "⚠︎" not in build_title(quota_title(ENTERPRISE, None), [])
+    assert no_quota_plan(ENTERPRISE) and not no_quota_plan(SAMPLE) and not no_quota_plan(None)
+    # other output without quota lines (expired login, new format) still warns and shows whole
+    expired = "Invalid API key · Please run /login"
+    assert not no_quota_plan(expired) and quota_title(expired, None) == "⚠︎ Claude"
+    assert menu_lines(expired) == [expired]
+    assert quota_title(None, None) is None  # before the first fetch
+    # Max-like output whose quota line changed format: same header, so it must still warn
+    changed = "You are currently using your subscription to power your Claude Code usage\n\nSession usage: 48% used (resets 1:40pm)\n"
+    assert not no_quota_plan(changed) and quota_title(changed, None) == "\u26a0\ufe0e Claude"
+
+    # session states: waitingFor text, unknown status shown raw
+    assert session_state({"status": "waiting", "waitingFor": "permission prompt"}) == ("⚠", "permission prompt")
+    assert session_state({"status": "waiting"}) == ("⚠", "waiting")
+    assert session_state({"status": "blocked"}) == ("·", "blocked")
+    assert session_row({"pid": 9, "cwd": "/a/proj", "status": "idle"}, "7% context") == "○ proj   7% context   idle"
+    assert session_row({"pid": 9, "name": "x-1", "status": "busy"}, "") == "● x-1   busy"
+
+    # notifications only on changes seen after the first poll
+    before = {1: {"status": "busy"}, 2: {"status": "busy", "statusUpdatedAt": 1000},
+              3: {"status": "waiting"}, 5: {"status": "busy", "statusUpdatedAt": 1000}}
+    now = [{"pid": 1, "status": "waiting"}, {"pid": 2, "status": "idle", "statusUpdatedAt": 9000},
+           {"pid": 3, "status": "waiting"}, {"pid": 4, "status": "waiting"},
+           {"pid": 5, "status": "idle", "statusUpdatedAt": 1700}]  # 0.7 s busy blip (/context): no "Finished"
+    assert [(k, s["pid"]) for k, s in session_events(before, now)] == [("notify_waiting", 1), ("notify_finished", 2)]
+    assert session_events({}, now) == []
+
     import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        def write(name, data):
+            with open(os.path.join(tmp, name), "w") as fh:
+                fh.write(data if isinstance(data, str) else json.dumps(data))
+        write("1.json", {"pid": 1, "status": "idle", "statusUpdatedAt": 5})
+        write("2.json", {"pid": 2, "status": "blocked", "statusUpdatedAt": 9})
+        write("3.json", {"pid": 3, "status": "busy"})  # crashed: pid dead
+        write("4.json", '{"pid": 4, "sta')  # mid-write
+        write("4.key", "x")
+        got = read_sessions(tmp, alive=lambda pid: pid != 3)
+        assert [s["pid"] for s in got] == [2, 1], got
+        write("5.json", {"pid": 2 ** 22 + 12345, "status": "idle"})  # real check: no such pid
+        write("6.json", {"pid": os.getpid(), "status": "idle"})
+        assert sorted(s["pid"] for s in read_sessions(tmp) if s["pid"] > 4) == [os.getpid()]
+        # a file caught mid-write keeps the last good copy, so the pid does not come back as "new"
+        for name in ("5.json", "6.json"):
+            os.remove(os.path.join(tmp, name))
+        write("7.json", {"pid": "7", "kind": "interactive", "status": "busy"})
+        write("8.json", {"pid": 8, "kind": "sdk-cli", "status": "busy"})  # not an interactive session
+        first = read_sessions(tmp, alive=lambda pid: True)
+        assert sorted(s["pid"] for s in first) == [1, 2, 3, 7], first  # 7: pid stored back as int; 8: skipped
+        write("7.json", '{"pid": 7, "kind": "interac')
+        again = read_sessions(tmp, alive=lambda pid: True, previous={s["pid"]: s for s in first})
+        assert [s for s in again if s["pid"] == 7] == [{"pid": 7, "kind": "interactive", "status": "busy"}], again
+        assert 7 not in [s["pid"] for s in read_sessions(tmp, alive=lambda pid: pid != 7, previous={7: first[0]})]
+        os.remove(os.path.join(tmp, "7.json"))  # file gone: dropped even with a previous copy
+        assert 7 not in [s["pid"] for s in read_sessions(tmp, alive=lambda pid: True, previous={s["pid"]: s for s in first})]
+
+        # context from the transcript tail; a reply far back is still found
+        reply = {"type": "assistant", "message": {"model": "claude-opus-5-5", "usage": {
+            "input_tokens": 3, "cache_read_input_tokens": 69_997}}}
+        side = {"type": "assistant", "isSidechain": True, "message": {"model": "x", "usage": {"input_tokens": 9}}}
+        write("t.jsonl", json.dumps(reply) + "\n" + ('{"type": "user", "pad": "%s"}\n' % ("x" * 1000)) * 2000
+              + json.dumps(side) + '\n{"type": "assistant", "trunc')
+        assert context_label(os.path.join(tmp, "t.jsonl")) == "7% context"
+        reply["message"]["model"] = "unknown"
+        write("u.jsonl", json.dumps(reply))
+        assert context_label(os.path.join(tmp, "u.jsonl")) == "70k context"
+        write("e.jsonl", "")
+        assert context_label(os.path.join(tmp, "e.jsonl")) == ""
+        # the tail read stops at TAIL_MAX: a reply further back is not found (the app keeps the last value)
+        write("far.jsonl", json.dumps(reply) + "\n" + ('{"type": "user", "pad": "%s"}\n' % ("x" * 1000)) * 5000)
+        assert context_label(os.path.join(tmp, "far.jsonl")) == ""
+
+    # notification toggles are kept as booleans next to the intervals
+    global CONFIG_PATH
+    saved_path = CONFIG_PATH
+    with tempfile.TemporaryDirectory() as tmp:
+        CONFIG_PATH = os.path.join(tmp, "c.json")
+        assert load_config() == DEFAULTS
+        changed = dict(DEFAULTS, notify_waiting=False, notify_finished=True, cold_minutes=9)
+        save_config(changed)
+        assert load_config() == changed
+        save_config(dict(DEFAULTS, notify_waiting="no", notify_finished=1))  # not bools: defaults
+        assert load_config() == DEFAULTS
+    CONFIG_PATH = saved_path
+
+    # install kind: Homebrew runs us through an opt symlink into the Cellar
     with tempfile.TemporaryDirectory() as tmp:
         libexec = os.path.join(tmp, "Cellar", "usagebar", "0.0.0", "libexec")
         os.makedirs(libexec)

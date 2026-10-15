@@ -17,16 +17,6 @@ from datetime import datetime
 import monitor
 from monitor import __version__
 
-PROJECTS = os.path.expanduser("~/.claude/projects")
-# Model max context windows (Anthropic docs). Claude Code auto-compacts earlier (500k for Opus 5.5).
-WINDOWS = {
-    model: 1_000_000 for model in (
-        "claude-fable-5-1", "claude-fable-5", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8",
-        "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-5-5", "claude-sonnet-5", "claude-sonnet-4-6",
-        "claude-haiku-5-5",
-    )
-}
-
 TOOLS = [
     {
         "name": "get_usage",
@@ -81,10 +71,9 @@ def find_transcript(session_id):
     if session_id:
         if not re.fullmatch(r"[\w-]+", session_id):  # keeps it inside PROJECTS
             raise ToolError("Invalid session_id")
-        hits = glob.glob(os.path.join(PROJECTS, "*", session_id + ".jsonl"))
-        return hits[0] if hits else None
+        return monitor.transcript_path(session_id)
     # shortcut: newest transcript for this cwd; wrong if two sessions share a project dir and the env var is missing
-    files = glob.glob(os.path.join(PROJECTS, re.sub(r"[^A-Za-z0-9]", "-", os.getcwd()), "*.jsonl"))
+    files = glob.glob(os.path.join(monitor.PROJECTS, re.sub(r"[^A-Za-z0-9]", "-", os.getcwd()), "*.jsonl"))
     return max(files, key=os.path.getmtime, default=None)
 
 
@@ -92,25 +81,12 @@ def get_context_size(args):
     path = find_transcript(args.get("session_id"))
     if not path:
         raise ToolError("Transcript not found")
-    usage = model = None
-    # shortcut: reads the whole transcript per call; seek from the end if multi-MB files get slow
-    with open(path) as fh:
-        for line in fh:
-            if '"assistant"' not in line:
-                continue
-            try:
-                entry = json.loads(line)
-            except ValueError:  # last line may still be mid-write
-                continue
-            msg = entry.get("message") or {}
-            if (entry.get("type") == "assistant" and not entry.get("isSidechain")
-                    and msg.get("usage") and msg.get("model") != "<synthetic>"):
-                usage, model = msg["usage"], msg.get("model")
-    if not usage:
+    found = monitor.last_usage(path)
+    if not found:
         raise ToolError("No replies in this transcript yet")
-    keys = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens")
-    tokens = sum(usage.get(k) or 0 for k in keys)
-    window = WINDOWS.get(model)  # None for a model not in the table
+    usage, model = found
+    tokens = monitor.context_tokens(usage)
+    window = monitor.WINDOWS.get(model)  # None for a model not in the table
     return {
         "session_id": os.path.basename(path)[:-len(".jsonl")],
         "model": model,
@@ -178,8 +154,7 @@ def serve():
 
 def test():
     import tempfile
-    global PROJECTS
-    PROJECTS = tempfile.mkdtemp()
+    PROJECTS = monitor.PROJECTS = tempfile.mkdtemp()
     monitor.STATE_PATH = os.path.join(PROJECTS, "state", "last.json")
     calls = []
     monitor.fetch = lambda: calls.append(1) or ("Current session: 5% used", None)
